@@ -1,9 +1,10 @@
 ## Interface: 16001
 ## Title: WritHelper Forever
 ## Notes: Сравнение заданий мастера и стоимости вещей для WoW Forever
-## Version: 0.15.0
+## Version: 0.19.2
 ## SavedVariablesPerCharacter: WritHelperDB
-## OptionalDeps: Auctionator, TradeSkillMaster, Auc-Advanced
+## OptionalDeps: Auctionator, TradeSkillMaster, Auc-Advanced, QuestieDB, Questie
+Localization.lua
 Data.lua
 Professions.lua
 WritHelper.lua

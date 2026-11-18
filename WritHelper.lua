@@ -1,12 +1,18 @@
 local ADDON = 'WritHelper'
-local VERSION = '0.15.0'
+local VERSION = '0.19.2'
+local L = WritHelperTranslate
 local data = WritHelperData or {}
-local frame, output, status, progressFrame, auctionButton, windowBar, windowPercent, scanInfoButton, resultsScroll
-local state = {phase='idle', message='Откройте аукцион и нажмите «Сканировать».', current=0, total=0}
+local frame, output, status, progressFrame, auctionButton, windowBar, windowPercent, scanInfoButton, resultsScroll, stopButton
+local state = {phase='idle', message=L('Откройте аукцион и нажмите «Сканировать».'), current=0, total=0}
 local events
 local startStandard
 local sourceLabel
 local showShoppingList
+local function closeOnEscape(name)
+  if type(UISpecialFrames)~='table' then return end
+  for _,existing in ipairs(UISpecialFrames) do if existing==name then return end end
+  table.insert(UISpecialFrames,name)
+end
 local function logEvent(message)
   if not WritHelperDB then return end
   WritHelperDB.log=WritHelperDB.log or {}
@@ -51,29 +57,31 @@ local function captureBank()
     if ok and okBags and type(total)=='number' and type(bags)=='number' then counts[id]=math.max(0,total-bags) end
   end
   WritHelperDB.bank={counts=counts,time=time()}
-  logEvent('Банк обновлён для заказов, вещей и материалов известных рецептов')
+  logEvent(L('Банк обновлён для заказов, вещей и материалов известных рецептов'))
 end
-local function money(n)
+local function money(n,iconSize)
   if not n then return '?' end
   n=math.floor(n+0.5)
   local gold=math.floor(n/10000)
   local silver=math.floor(n/100)%100
   local copper=n%100
   local parts={}
-  if gold>0 then parts[#parts+1]=gold..' |TInterface\\MoneyFrame\\UI-GoldIcon:16:16:2:0|t' end
-  if silver>0 then parts[#parts+1]=silver..' |TInterface\\MoneyFrame\\UI-SilverIcon:16:16:2:0|t' end
-  if copper>0 or #parts==0 then parts[#parts+1]=copper..' |TInterface\\MoneyFrame\\UI-CopperIcon:16:16:2:0|t' end
+  local size=tostring(iconSize or 16)
+  if gold>0 then parts[#parts+1]=gold..' |TInterface\\MoneyFrame\\UI-GoldIcon:'..size..':'..size..':2:0|t' end
+  if silver>0 then parts[#parts+1]=silver..' |TInterface\\MoneyFrame\\UI-SilverIcon:'..size..':'..size..':2:0|t' end
+  if copper>0 or #parts==0 then parts[#parts+1]=copper..' |TInterface\\MoneyFrame\\UI-CopperIcon:'..size..':'..size..':2:0|t' end
   return table.concat(parts,'  ')
 end
 local function updateProgress(text, isError)
   state.message=text; state.error=isError
+  if stopButton then if state.phase~='idle' then stopButton:Show() else stopButton:Hide() end end
   if status then status:SetText(text) end
   local total=math.max(state.total or 0,1)
   local current=math.min(state.current or 0,total)
   if windowBar then
     windowBar:SetMinMaxValues(0,total); windowBar:SetValue(current)
     if isError then windowBar:SetStatusBarColor(0.8,0.18,0.15) else windowBar:SetStatusBarColor(0.2,0.65,0.28) end
-    if state.phase=='waiting' then windowPercent:SetText('Ожидание ответа')
+    if state.phase=='waiting' then windowPercent:SetText(L('Ожидание ответа'))
     elseif (state.total or 0)>0 then windowPercent:SetText(math.floor(current*100/total)..'%')
     else windowPercent:SetText('—') end
   end
@@ -83,11 +91,11 @@ local function updateProgress(text, isError)
     local icon
     if state.phase~='idle' then
       icon='|TInterface\\RaidFrame\\ReadyCheck-Waiting:16:16|t'
-      if state.phase=='waiting' then icon=icon..' ожидание '..tostring(state.waitPercent or 0)..'%'
+      if state.phase=='waiting' then icon=icon..L(' ожидание ')..tostring(state.waitPercent or 0)..'%'
       elseif (state.total or 0)>0 then icon=icon..' '..math.floor(current*100/total)..'%' end
     elseif state.error or not snapshot then icon='|TInterface\\RaidFrame\\ReadyCheck-NotReady:16:16|t'
     else icon='|TInterface\\RaidFrame\\ReadyCheck-Ready:16:16|t' end
-    scanInfoButton.label:SetText(icon..'  '..stamp..(snapshot and ('  - заказов: '..tostring(state.foundCount or 0)) or ''))
+    scanInfoButton.label:SetText(icon..'  '..stamp..(snapshot and (L('  - заказов: ')..tostring(state.foundCount or 0)) or ''))
   end
   if auctionButton and auctionButton.scanBadge then
     if auctionButton.icon then
@@ -110,11 +118,30 @@ local function updateProgress(text, isError)
   end
 end
 local function fail(text)
-  logEvent('Ошибка/остановка: '..text)
+  logEvent(L('Ошибка/остановка: ')..text)
   state.phase='idle'; state.token=(state.token or 0)+1
   updateProgress(text, true); msg(text)
 end
-local lastProfessionReport
+local function stopScan()
+  if state.phase=='idle' then return end
+  state.phase='idle'; state.token=(state.token or 0)+1
+  state.pending=nil; state.requests=nil; state.current=0; state.total=0
+  local message=L('Сканирование остановлено. Предыдущие результаты сохранены.')
+  logEvent(message); updateProgress(message,false); msg(message)
+end
+local function saveRecipe(product,recipe)
+  local old=WritHelperDB.recipes[product]
+  local same=old and old.profession==recipe.profession and old.makes==recipe.makes and type(old.reagents)=='table' and #old.reagents==#recipe.reagents
+  if same then
+    for i,reagent in ipairs(recipe.reagents) do
+      local previous=old.reagents[i]
+      if not previous or previous.id~=reagent.id or previous.count~=reagent.count then same=false; break end
+    end
+  end
+  if same then return false end
+  WritHelperDB.recipes[product]=recipe
+  return true
+end
 local function captureModernTradeskill()
   local api=C_TradeSkillUI
   if not api or not api.GetAllRecipeIDs or not api.GetRecipeInfo or not api.GetRecipeSchematic then return false end
@@ -122,7 +149,7 @@ local function captureModernTradeskill()
   if type(ids)~='table' or #ids==0 then return false end
   local relevant={}
   for _,entry in ipairs(data) do relevant[entry.item]=true end
-  local seen, unsupported=0,0
+  local changed, unsupported=0,0
   for _,recipeID in ipairs(ids) do
     local info=api.GetRecipeInfo(recipeID)
     if info and info.learned then
@@ -142,22 +169,21 @@ local function captureModernTradeskill()
           end
         end
         if valid and #ingredients>0 then
-          local profession='Профессия'
+          local profession=L('Профессия')
           if api.GetTradeSkillLineForRecipe then
             local success,_,name=pcall(api.GetTradeSkillLineForRecipe,recipeID)
             if success and type(name)=='string' and name~='' then profession=name end
           end
-          WritHelperDB.recipes[schematic.outputItemID]={profession=profession,reagents=ingredients,makes=math.max(tonumber(schematic.quantityMin) or 1,1)}
-          seen=seen+1
+          if saveRecipe(schematic.outputItemID,{profession=profession,reagents=ingredients,makes=math.max(tonumber(schematic.quantityMin) or 1,1)}) then changed=changed+1 end
         else
           unsupported=unsupported+1
         end
       end
     end
   end
-  local report='Профессия: найдено подходящих рецептов '..seen..'; требуется проверка '..unsupported
-  if report~=lastProfessionReport then
-    lastProfessionReport=report; logEvent(report); msg(report..'. Для цен материалов обновите сканирование аукциона.')
+  if changed>0 then
+    local report=L('Профессия: добавлено или обновлено рецептов ')..changed..L('; требуется проверка ')..unsupported
+    logEvent(report); msg(report..L('. Для цен материалов обновите сканирование аукциона.'))
   end
   return true
 end
@@ -168,7 +194,7 @@ local function captureTradeskill()
   if not profession or profession=='UNKNOWN' then return end
   local num=GetNumTradeSkills()
   if not num or num==0 then return end
-  local seen=0
+  local changed=0
   for i=1,num do
     local product=idFromLink(GetTradeSkillItemLink(i))
     if product then
@@ -180,12 +206,11 @@ local function captureTradeskill()
       end
       local makes=GetTradeSkillNumMade and GetTradeSkillNumMade(i) or 1
       if valid and #ingredients>0 then
-        WritHelperDB.recipes[product]={profession=profession,reagents=ingredients,makes=math.max(tonumber(makes) or 1,1)}
-        seen=seen+1
+        if saveRecipe(product,{profession=profession,reagents=ingredients,makes=math.max(tonumber(makes) or 1,1)}) then changed=changed+1 end
       end
     end
   end
-  if seen>0 then msg('Рецепты: '..profession..', записано '..seen..'.') end
+  if changed>0 then msg(L('Рецепты: ')..profession..L(', добавлено или обновлено ')..changed..'.') end
 end
 -- Last recorded prices cannot establish current stock or exact stack costs.
 local function auctionatorPrice(id)
@@ -209,12 +234,12 @@ local function externalPrice(id)
     if ok and type(value)=='number' and value>0 then return value,'auctioneer' end
   end
 end
-local sourceNames={auctionator='Auctionator',tsm='TSM',tsm_market='TSM (рыночная)',auctioneer='Auctioneer (рыночная)'}
+local sourceNames={auctionator='Auctionator',tsm='TSM',tsm_market=L('TSM (рыночная)'),auctioneer=L('Auctioneer (рыночная)')}
 local function sourceText(used)
-  if used and used.auctionator and not used.tsm and not used.tsm_market and not used.auctioneer then return 'Auctionator: цены использованы в текущем списке.' end
+  if used and used.auctionator and not used.tsm and not used.tsm_market and not used.auctioneer then return L('Auctionator: цены использованы в текущем списке.') end
   local names={}
   for _,key in ipairs({'auctionator','tsm','tsm_market','auctioneer'}) do if used and used[key] then names[#names+1]=sourceNames[key] end end
-  return #names>0 and ('Использованы цены: '..table.concat(names,', ')..'.') or 'Внешние цены в текущем списке не использованы.'
+  return #names>0 and (L('Использованы цены: ')..table.concat(names,', ')..'.') or L('Внешние цены в текущем списке не использованы.')
 end
 local function buyCost(snapshot,id,required)
   if required<=0 then return 0,false end
@@ -269,11 +294,11 @@ local function availableCount(snapshot,id)
 end
 local function availability(snapshot,id)
   local count=availableCount(snapshot,id)
-  return count and ('в продаже: '..count) or 'наличие неизвестно'
+  return count and (count..L(' в продаже')) or L('наличие неизвестно')
 end
 local function craftInfo(snapshot,id,quantity)
   local recipe=WritHelperDB.recipes[id]
-  if not recipe then return nil,'неизвестно: откройте профессию',false,nil end
+  if not recipe then return nil,L('неизвестно: откройте профессию'),false,nil end
   local crafts=math.ceil(quantity/(recipe.makes or 1))
   local total,valid,materials,estimated,usedSources=0,true,{},false,{}
   for _,reagent in ipairs(recipe.reagents) do
@@ -288,8 +313,8 @@ local function craftInfo(snapshot,id,quantity)
     materials[#materials+1]={id=reagent.id,need=need,bags=bags,bank=bank,missing=missing}
   end
   local bank=WritHelperDB.bank
-  local bankNote=bank and bank.time and date and ('; банк: '..date('%d.%m %H:%M',bank.time)) or '; банк: не проверен'
-  local summary=recipe.profession..(valid and ('; докупить '..money(total)..(estimated and ' (оценка)' or '')) or '; цена или наличие материалов неизвестны')..bankNote
+  local bankNote=bank and bank.time and date and (L('; банк: ')..date('%d.%m %H:%M',bank.time)) or L('; банк: не проверен')
+  local summary=recipe.profession..(valid and (L('; докупить ')..money(total)..(estimated and L(' (оценка)') or '')) or L('; цена или наличие материалов неизвестны'))..bankNote
   return valid and total or nil,summary,estimated,materials,valid and usedSources or nil
 end
 local cards, resultHeader = {}, nil
@@ -313,14 +338,14 @@ local function shoppingVisible()
   return AuctionatorShoppingFrame and AuctionatorShoppingFrame.IsVisible and AuctionatorShoppingFrame:IsVisible()
 end
 local function putSearch(id, startSearch)
-  if state.phase~='idle' then msg('Дождитесь завершения сканирования перед поиском.') return end
+  if state.phase~='idle' then msg(L('Дождитесь завершения сканирования перед поиском.')) return end
   local name=itemName(id)
-  if not name then msg('Название предмета ещё загружается, попробуйте снова.') return end
+  if not name then msg(L('Название предмета ещё загружается, попробуйте снова.')) return end
   local options=shoppingVisible() and AuctionatorShoppingFrame.SearchOptions
   if options and options.SearchString and options.SearchString.SetText then
     options.SearchString:SetText(name)
     if startSearch then
-      if not options.SearchButton or not options.SearchButton.Click then msg('Не удалось запустить поиск Auctionator.') return end
+      if not options.SearchButton or not options.SearchButton.Click then msg(L('Не удалось запустить поиск Auctionator.')) return end
       options.SearchButton:Click()
     elseif options.SearchString.SetFocus then options.SearchString:SetFocus() end
   else
@@ -330,21 +355,21 @@ local function putSearch(id, startSearch)
     if box and box.SetText then
       box:SetText(name)
       if startSearch then
-        if not bar.StartSearch then msg('Не удалось запустить поиск аукциона.') return end
+        if not bar.StartSearch then msg(L('Не удалось запустить поиск аукциона.')) return end
         bar:StartSearch()
       elseif box.SetFocus then box:SetFocus() end
     elseif ah and ah.SetSearchText then
       ah:SetSearchText(name)
-      if startSearch then msg('Название добавлено. Нажмите «Поиск» в аукционе.') return end
+      if startSearch then msg(L('Название добавлено. Нажмите «Поиск» в аукционе.')) return end
     elseif _G.BrowseName and _G.BrowseName.SetText then
       _G.BrowseName:SetText(name)
       if startSearch and _G.BrowseSearchButton and _G.BrowseSearchButton.Click then _G.BrowseSearchButton:Click()
-      elseif startSearch then msg('Название добавлено. Нажмите «Поиск» в аукционе.') return end
+      elseif startSearch then msg(L('Название добавлено. Нажмите «Поиск» в аукционе.')) return end
     else
-      msg('Не удалось найти строку поиска аукциона. Откройте аукцион и попробуйте снова.') return
+      msg(L('Не удалось найти строку поиска аукциона. Откройте аукцион и попробуйте снова.')) return
     end
   end
-  msg((startSearch and 'Поиск: ' or 'В строку поиска добавлено: ')..name)
+  msg((startSearch and L('Поиск: ') or L('В строку поиска добавлено: '))..name)
 end
 local function iconAt(parent,x)
   local button=CreateFrame('Button',nil,parent)
@@ -356,6 +381,99 @@ local function iconAt(parent,x)
   button:SetScript('OnLeave',function() if GameTooltip then GameTooltip:Hide() end end)
   button:SetScript('OnClick',function(self) if IsShiftKeyDown and IsShiftKeyDown() then putSearch(self.itemID) end end)
   return button
+end
+local function writQuestID(writ)
+  if writ<264011 or writ>264160 then return nil end
+  return writ==264011 and 94004 or writ-169800
+end
+-- Wowhead guide and player reports, 2026-11-15: the coordinates are approximate.
+local reportedTurnins={
+  [264117]={1419,0.52,0.35,'npc:7363',"Kum'isha"}, [264153]={1419,0.52,0.35,'npc:7363',"Kum'isha"},
+  [264146]={1430,0.47,0.75,'npc:257743','Hastings'}, [264155]={1430,0.47,0.75,'npc:257743','Hastings'},
+}
+local function turninLocation(writ)
+  local questID=writQuestID(writ)
+  if not questID then return nil end
+  local mapID,x,y,key,name,community
+  local db=LibQuestieDB
+  if db and db.Quest and db.Npc and QuestieLoader and QuestieLoader.ImportModule then
+    local ok,zoneDB=pcall(QuestieLoader.ImportModule,QuestieLoader,'ZoneDB')
+    if ok and zoneDB and type(zoneDB.GetUiMapIdByAreaId)=='function' then
+      local success,finishers=pcall(db.Quest.Get,questID,'finishedBy')
+      local targets=success and type(finishers)=='table' and {{db.Npc,finishers[1],'npc:'},{db.Object,finishers[2],'object:'}} or {}
+      for _,target in ipairs(targets) do
+        local entity,ids=target[1],target[2]
+        if entity and type(entity.Get)=='function' and type(ids)=='table' then
+        for _,entityID in ipairs(ids) do
+          local good,spawns=pcall(entity.Get,entityID,'spawns')
+          if good and type(spawns)=='table' then
+            local areas={}; for area in pairs(spawns) do if type(area)=='number' then areas[#areas+1]=area end end; table.sort(areas)
+            for _,area in ipairs(areas) do
+              local points=spawns[area]; local point=type(points)=='table' and points[1]
+              local valid,id=pcall(zoneDB.GetUiMapIdByAreaId,zoneDB,area)
+              if valid and type(id)=='number' and id>0 and type(point)=='table' and type(point[1])=='number' and type(point[2])=='number' and point[1]>=0 and point[1]<=100 and point[2]>=0 and point[2]<=100 then
+                mapID,x,y,key=id,point[1]/100,point[2]/100,target[3]..entityID
+                local named,npcName=pcall(entity.Get,entityID,'name')
+                name=named and type(npcName)=='string' and npcName~='' and npcName or nil
+                break
+              end
+            end
+          end
+          if mapID then break end
+        end
+        end
+        if mapID then break end
+      end
+    end
+  end
+  if not mapID and reportedTurnins[writ] then local point=reportedTurnins[writ]; mapID,x,y,key,name,community=point[1],point[2],point[3],point[4],point[5],true end
+  if not mapID then return nil end
+  local zone
+  if C_Map and C_Map.GetMapInfo then local ok,info=pcall(C_Map.GetMapInfo,mapID); if ok and type(info)=='table' then zone=info.name end end
+  return {mapID=mapID,x=x,y=y,key=key,name=name,zone=zone,community=community}
+end
+local function showTurninMap(writ)
+  if InCombatLockdown and InCombatLockdown() then msg(L('Карта недоступна во время боя.')); return end
+  local questID=writQuestID(writ)
+  if not questID then msg(L('Место сдачи неизвестно. Примите задание и проверьте игровую карту или обновите Questie.')); return end
+  local location=turninLocation(writ)
+  local mapID,x,y,route,community
+  if location then mapID,x,y,community=location.mapID,location.x,location.y,location.community end
+  if not mapID and C_QuestLog and C_QuestLog.GetNextWaypoint then
+    local ok,id,px,py=pcall(C_QuestLog.GetNextWaypoint,questID)
+    if ok and type(id)=='number' and id>0 and type(px)=='number' and type(py)=='number' and px>=0 and px<=1 and py>=0 and py<=1 then mapID,x,y,route=id,px,py,true end
+  end
+  if not mapID then msg(L('Место сдачи неизвестно. Примите задание и проверьте игровую карту или обновите Questie.')); return end
+  if not C_Map or not C_Map.SetUserWaypoint or not UiMapPoint or not UiMapPoint.CreateFromCoordinates then msg(L('Не удалось открыть карту или поставить метку.')); return end
+  local ok=pcall(function()
+    if C_Map.CanSetUserWaypointOnMap and not C_Map.CanSetUserWaypointOnMap(mapID) then error('waypoint unavailable') end
+    local point=UiMapPoint.CreateFromCoordinates(mapID,x,y)
+    C_Map.SetUserWaypoint(point)
+    if C_Map.OpenWorldMap then C_Map.OpenWorldMap(mapID)
+    elseif WorldMapFrame then WorldMapFrame:Show(); WorldMapFrame:SetMapID(mapID)
+    else error('map unavailable') end
+  end)
+  if not ok then msg(L('Не удалось открыть карту или поставить метку.')); return end
+  if route then msg(L('Открыта следующая точка маршрута из игры; она может быть переходом, а не местом сдачи.')) end
+  if community then msg(L('Метка приблизительная: координаты сообщены игроками Wowhead.')) end
+end
+local function locationOptions()
+  local options={{key='all',name=L('Все локации')},{key='unknown',name=L('Локация неизвестна')}}
+  local found={}
+  for _,entry in ipairs(data) do
+    local loc=turninLocation(entry.writ)
+    if loc and loc.mapID then
+      local key='map:'..loc.mapID
+      if not found[key] then
+        local place=loc.zone and loc.zone~='' and loc.zone or (L('Локация #')..loc.mapID)
+        found[key]={key=key,name=place}
+      end
+    end
+  end
+  local sorted={}; for _,option in pairs(found) do sorted[#sorted+1]=option end
+  table.sort(sorted,function(a,b) return a.name<b.name end)
+  for _,option in ipairs(sorted) do options[#options+1]=option end
+  return options
 end
 local function getCard(index)
   if cards[index] then return cards[index] end
@@ -371,22 +489,24 @@ local function getCard(index)
   card.levelWarning=textAt(card,'GameFontHighlightSmall',402,-56,295)
   card.choice=textAt(card,'GameFontNormalSmall',57,-56,335)
   card.completed=textAt(card,'GameFontHighlightSmall',14,-76,685)
-  card.profession=textAt(card,'GameFontHighlightSmall',14,-76,685)
-  card.total=card:CreateFontString(nil,'OVERLAY','GameFontNormal'); card.total:SetPoint('BOTTOMLEFT',14,12); card.total:SetWidth(500); card.total:SetJustifyH('LEFT')
+  card.total=card:CreateFontString(nil,'OVERLAY','GameFontNormalLarge'); card.total:SetPoint('BOTTOMLEFT',14,12); card.total:SetWidth(190); card.total:SetJustifyH('LEFT')
+  card.repPrice=card:CreateFontString(nil,'OVERLAY','GameFontHighlightSmall'); card.repPrice:SetPoint('BOTTOMLEFT',220,13); card.repPrice:SetWidth(205); card.repPrice:SetJustifyH('LEFT'); card.repPrice:SetTextColor(0.65,0.65,0.65)
   card.materialLines={}
   local function nameClick(x,field)
     local b=CreateFrame('Button',nil,card); b:SetSize(285,25); b:SetPoint('TOPLEFT',x,-10)
     b:SetScript('OnClick',function() if IsShiftKeyDown and IsShiftKeyDown() then putSearch(card[field]) end end)
   end
   nameClick(57,'writID'); nameClick(402,'itemID')
-  card.shop=CreateFrame('Button',nil,card,'UIPanelButtonTemplate'); card.shop:SetSize(152,24); card.shop:SetPoint('BOTTOMRIGHT',-8,7); card.shop:SetText('Список покупок')
+  card.shop=CreateFrame('Button',nil,card,'UIPanelButtonTemplate'); card.shop:SetSize(152,24); card.shop:SetPoint('BOTTOMRIGHT',-8,7); card.shop:SetText(L('Список покупок'))
   card.shop:SetScript('OnClick',function() if card.entry then showShoppingList(card.entry) end end)
+  card.map=CreateFrame('Button',nil,card,'UIPanelButtonTemplate'); card.map:SetSize(110,24); card.map:SetPoint('BOTTOMRIGHT',-165,7); card.map:SetText(L('На карте'))
+  card.map:SetScript('OnClick',function() if card.entry then showTurninMap(card.entry.writ) end end)
   cards[index]=card
   return card
 end
 local function completedToday(writ)
-  if writ<264011 or writ>264160 then return false end
-  local questID=writ==264011 and 94004 or writ-169800
+  local questID=writQuestID(writ)
+  if not questID then return false end
   local check=C_QuestLog and C_QuestLog.IsQuestFlaggedCompleted or IsQuestFlaggedCompleted
   if type(check)~='function' then return false end
   local ok,completed=pcall(check,questID)
@@ -399,15 +519,18 @@ local function refresh()
   for _,card in ipairs(cards) do card:Hide() end
   local lines, rows={},{}
   if not snapshot then
-    lines[#lines+1]='Своего сканирования нет. Цены других аддонов — оценка, наличие неизвестно.'
-    lines[#lines+1]='Откройте свои профессии заранее, чтобы записать рецепты.'
+    lines[#lines+1]=L('Своего сканирования нет. Цены других аддонов — оценка, наличие неизвестно.')
+    lines[#lines+1]=L('Откройте свои профессии заранее, чтобы записать рецепты.')
   end
   do
     for _,e in ipairs(data) do
       local writCost,writEstimated,writSource=buyCost(snapshot,e.writ,1)
       local profs=WritHelperProfessions and WritHelperProfessions[e.writ]
       local profMatches=not WritHelperDB.profFilter or WritHelperDB.profFilter=='all' or (profs and profs[WritHelperDB.profFilter])
-      if writCost and profMatches and (not WritHelperDB.repFilter or WritHelperDB.repFilter==0 or e.rep==WritHelperDB.repFilter) then
+      local selectedLocation=WritHelperDB.locationFilter or 'all'
+      local location=selectedLocation~='all' and turninLocation(e.writ) or nil
+      local locationMatches=selectedLocation=='all' or (selectedLocation=='unknown' and not location) or (location and ('map:'..location.mapID)==selectedLocation)
+      if writCost and profMatches and locationMatches and (WritHelperDB.hideCompleted==false or not completedToday(e.writ)) and (not WritHelperDB.repFilter or WritHelperDB.repFilter==0 or e.rep==WritHelperDB.repFilter) then
         local itemCost,itemEstimated,itemSource=buyCost(snapshot,e.item,e.count)
         local craft,detail,craftEstimated,materials,craftSources=craftInfo(snapshot,e.item,e.count)
         local best,bestEstimated=itemCost,itemEstimated
@@ -432,7 +555,7 @@ local function refresh()
       if a.total then return true elseif b.total then return false end
       return a.entry.writ<b.entry.writ
     end)
-    if #rows==0 then lines[#lines+1]='Заказы не найдены. Проверьте полноту сканирования и фильтр в настройках.' end
+    if #rows==0 then lines[#lines+1]=L('Заказы не найдены. Проверьте полноту сканирования и фильтр в настройках.') end
   end
   state.foundCount=#rows
   if sourceLabel then
@@ -449,10 +572,9 @@ local function refresh()
     local materialCount=showMaterials and #row.materials or 0
     local completed=completedToday(e.writ)
     local completedOffset=completed and 19 or 0
-    local height=128+materialCount*19+completedOffset
+    local height=109+materialCount*19+completedOffset
     card:SetHeight(height); card.accent:SetHeight(height)
-    card.completed:SetText(completed and '|cffff5555Сегодня уже выполнено — повторно сдать нельзя.|r' or '')
-    card.profession:ClearAllPoints(); card.profession:SetPoint('TOPLEFT',14,-76-completedOffset)
+    card.completed:SetText(completed and L('|cffff5555Сегодня уже выполнено — повторно сдать нельзя.|r') or '')
     card:ClearAllPoints(); card:SetPoint('TOPLEFT',0,-offset)
     offset=offset+height+8
     for _,line in ipairs(card.materialLines) do line:Hide() end
@@ -460,45 +582,41 @@ local function refresh()
       for i,material in ipairs(row.materials) do
         local line=card.materialLines[i]
         if not line then line=textAt(card,'GameFontHighlightSmall',25,0,675); card.materialLines[i]=line end
-        line:ClearAllPoints(); line:SetPoint('TOPLEFT',25,-96-completedOffset-(i-1)*19)
+        line:ClearAllPoints(); line:SetPoint('TOPLEFT',25,-77-completedOffset-(i-1)*19)
         local have=material.bags+(material.bank or 0)
         local icon
         if have>=material.need then icon='|TInterface\\RaidFrame\\ReadyCheck-Ready:13:13|t'
         elseif material.bank==nil then icon='|TInterface\\RaidFrame\\ReadyCheck-Waiting:13:13|t'
         else icon='|TInterface\\RaidFrame\\ReadyCheck-NotReady:13:13|t' end
-        local bankText=material.bank~=nil and tostring(material.bank) or 'не проверен'
+        local bankText=material.bank~=nil and tostring(material.bank) or L('не проверен')
         if material.bank and material.bank>0 then bankText='|cff55ee77'..bankText..'|r' end
-        line:SetText(icon..'  '..(itemName(material.id) or ('#'..material.id))..' - нужно '..material.need..', сумки '..material.bags..', банк '..bankText)
+        line:SetText(icon..'  '..(itemName(material.id) or ('#'..material.id))..L(' - нужно ')..material.need..L(', сумки ')..material.bags..L(', банк ')..bankText)
         line:Show()
       end
     end
     card.writIcon.itemID=e.writ; card.writIcon.texture:SetTexture(iconTexture(e.writ))
     card.itemIcon.itemID=e.item; card.itemIcon.texture:SetTexture(iconTexture(e.item))
-    card.writName:SetText(index..'. '..(itemName(e.writ) or ('Заказ #'..e.writ)))
-    card.itemName:SetText((itemName(e.item) or ('Предмет #'..e.item))..(e.count>1 and (' x'..e.count) or ''))
-    local estimate=row.totalEstimated and ' (оценка)' or ''
-    card.writPrice:SetText(money(row.writCost)..(row.writEstimated and (' (оценка'..(row.writSource and ': '..sourceNames[row.writSource] or '')..')') or '')..'  •  '..availability(snapshot,e.writ)..'  •  '..e.rep..' реп.')
-    card.itemPrice:SetText((row.itemCost and (money(row.itemCost)..(row.itemEstimated and (' (оценка'..(row.itemSource and ': '..sourceNames[row.itemSource] or '')..')') or '')) or 'не найдено / недостаточно')..'  •  '..availability(snapshot,e.item))
+    card.writName:SetText(index..'. '..(itemName(e.writ) or (L('Заказ #')..e.writ)))
+    card.itemName:SetText((itemName(e.item) or (L('Предмет #')..e.item))..(e.count>1 and (' x'..e.count) or ''))
+    card.writPrice:SetText(money(row.writCost)..'  •  '..availability(snapshot,e.writ)..'  •  '..e.rep..L(' реп.'))
+    card.itemPrice:SetText((row.itemCost and money(row.itemCost) or L('не найдено / недостаточно'))..'  •  '..availability(snapshot,e.item))
     local info=C_Item and C_Item.GetItemInfo or GetItemInfo
     local required=info and select(5,info(e.writ))
     local playerLevel=UnitLevel and UnitLevel('player')
     if type(required)=='number' and required>0 and type(playerLevel)=='number' and playerLevel<required then
-      card.levelWarning:SetText('|cffff5555Внимание: использовать заказ можно с '..required..' уровня; у вас '..playerLevel..'.|r')
+      card.levelWarning:SetText(L('|cffff5555Внимание: использовать заказ можно с ')..required..L(' уровня; у вас ')..playerLevel..'.|r')
     else
       card.levelWarning:SetText('')
     end
     local choice
     if row.itemCost and row.craftCost then
-      if row.craftCost<row.itemCost then choice='Выгоднее изготовить'
-      elseif row.itemCost<row.craftCost then choice='Выгоднее купить'
-      else choice='Стоимость одинакова' end
-      if row.itemEstimated or row.craftEstimated then choice=choice..' (оценка)' end
-    elseif row.craftCost then choice='Покупка: цена неизвестна'
-    elseif row.itemCost then choice='Изготовление: цена неизвестна'
-    else choice='Недостаточно цен для сравнения' end
+      if row.craftCost<row.itemCost then choice=L('Выгоднее изготовить')
+      elseif row.itemCost<row.craftCost then choice=L('Выгоднее купить')
+      else choice=L('Стоимость одинакова') end
+    else choice='' end
     card.choice:SetText(choice)
-    card.profession:SetText('Изготовление: '..row.detail)
-    card.total:SetText(row.total and ('ИТОГО: '..money(row.total)..'   •   за 100 реп.: '..money(row.total*100/e.rep)..estimate) or 'ИТОГО: недостаточно данных для расчёта')
+    card.total:SetText(row.total and money(row.total) or L('Цена неизвестна'))
+    card.repPrice:SetText(row.total and (L('за 100 реп.: ')..money(row.total*100/e.rep,12)) or '')
     card:Show()
   end
   output:SetHeight(math.max(430,offset+10))
@@ -520,9 +638,9 @@ local function auctionatorList(entry)
   local api=Auctionator and Auctionator.API and Auctionator.API.v1
   local manager=Auctionator and Auctionator.Shopping and Auctionator.Shopping.ListManager
   if not api or not api.CreateShoppingList or not api.ConvertToSearchString or not manager then
-    msg('Не удалось открыть список Auctionator. Проверьте, включён ли аддон.') return
+    msg(L('Не удалось открыть список Auctionator. Проверьте, включён ли аддон.')) return
   end
-  if state.phase~='idle' then msg('Дождитесь завершения сканирования перед созданием списка.') return end
+  if state.phase~='idle' then msg(L('Дождитесь завершения сканирования перед созданием списка.')) return end
   local buy,materials,recipe=shoppingEntries(entry)
   local groups={}
   if recipe then
@@ -531,18 +649,18 @@ local function auctionatorList(entry)
       local missing=math.max(0,material.count-ownedCount(material.id))
       if missing>0 then craft[#craft+1]={id=material.id,count=missing} end
     end
-    groups[#groups+1]={name='Материалы',entries=craft}
+    groups[#groups+1]={name=L('Материалы'),entries=craft}
   end
-  groups[#groups+1]={name='Готовое',entries=buy}
+  groups[#groups+1]={name=L('Готовое'),entries=buy}
   local baseName=itemName(entry.item)
-  if not baseName then msg('Название предмета ещё загружается. Повторите попытку.') return end
+  if not baseName then msg(L('Название предмета ещё загружается. Повторите попытку.')) return end
   for _,group in ipairs(groups) do
     group.terms={}
     for _,item in ipairs(group.entries) do
       local name=itemName(item.id)
-      if not name then msg('Название предмета ещё загружается. Повторите попытку.') return end
+      if not name then msg(L('Название предмета ещё загружается. Повторите попытку.')) return end
       local ok,term=pcall(api.ConvertToSearchString,ADDON,{searchString=name,isExact=true,quantity=item.count})
-      if not ok or type(term)~='string' then msg('Не удалось подготовить позицию списка: '..tostring(term)) return end
+      if not ok or type(term)~='string' then msg(L('Не удалось подготовить позицию списка: ')..tostring(term)) return end
       group.terms[#group.terms+1]=term
     end
   end
@@ -551,34 +669,34 @@ local function auctionatorList(entry)
     local listName,n=base,2
     while manager:GetIndexForName(listName) do listName=base..' ('..n..')'; n=n+1 end
     local ok,err=pcall(api.CreateShoppingList,ADDON,listName,group.terms)
-    if not ok then msg('Не удалось создать список Auctionator: '..tostring(err)); return end
+    if not ok then msg(L('Не удалось создать список Auctionator: ')..tostring(err)); return end
   end
-  msg('Списки Auctionator созданы. Готовый предмет и изготовление — разные варианты.')
+  msg(L('Списки Auctionator созданы. Готовый предмет и изготовление — разные варианты.'))
 end
 showShoppingList=function(entry)
   if shoppingVisible() then auctionatorList(entry) end
   if not shoppingWindow then
     shoppingWindow=CreateFrame('Frame','WritHelperShoppingWindow',UIParent,'BasicFrameTemplateWithInset')
-    if UISpecialFrames then table.insert(UISpecialFrames,'WritHelperShoppingWindow') end
+    closeOnEscape('WritHelperShoppingWindow')
     shoppingWindow:SetSize(550,420); shoppingWindow:SetPoint('CENTER',100,0); shoppingWindow:SetFrameStrata('DIALOG')
     shoppingWindow:SetMovable(true); shoppingWindow:EnableMouse(true); shoppingWindow:RegisterForDrag('LeftButton')
     shoppingWindow:SetScript('OnDragStart',shoppingWindow.StartMoving); shoppingWindow:SetScript('OnDragStop',shoppingWindow.StopMovingOrSizing)
-    local title=shoppingWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); title:SetPoint('TOP',0,-7); title:SetText('Список покупок')
+    local title=shoppingWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); title:SetPoint('TOP',0,-7); title:SetText(L('Список покупок'))
     shoppingTitle=textAt(shoppingWindow,'GameFontNormalSmall',18,-36,500)
     local scroll=CreateFrame('ScrollFrame','WritHelperShoppingScroll',shoppingWindow,'UIPanelScrollFrameTemplate'); scroll:SetPoint('TOPLEFT',18,-74); scroll:SetPoint('BOTTOMRIGHT',-35,20)
     shoppingContent=CreateFrame('Frame',nil,scroll); shoppingContent:SetSize(490,320); scroll:SetScrollChild(shoppingContent)
   end
   if frame then shoppingWindow:SetFrameLevel(frame:GetFrameLevel()+45) end
-  shoppingTitle:SetText('Готовый предмет и ингредиенты — разные варианты выполнения.')
+  shoppingTitle:SetText(L('Готовый предмет и ингредиенты — разные варианты выполнения.'))
   for _,row in ipairs(shoppingRows) do row:Hide() end
   local buy,materials,recipe=shoppingEntries(entry)
-  local entries={{heading='Купить готовое'}}
+  local entries={{heading=L('Купить готовое')}}
   for _,item in ipairs(buy) do entries[#entries+1]=item end
-  entries[#entries+1]={heading='Для изготовления'}
+  entries[#entries+1]={heading=L('Для изготовления')}
   if recipe then
     for _,item in ipairs(materials) do entries[#entries+1]=item end
   else
-    entries[#entries+1]={heading='Рецепт не записан. Откройте окно профессии.'}
+    entries[#entries+1]={heading=L('Рецепт не записан. Откройте окно профессии.')}
   end
   local offset=0
   for i,item in ipairs(entries) do
@@ -594,7 +712,7 @@ showShoppingList=function(entry)
       row.text=textAt(row,'GameFontHighlightSmall',47,-6,330)
       row.details=textAt(row,'GameFontNormalSmall',47,-26,330)
       row.details:ClearAllPoints(); row.details:SetPoint('TOPLEFT',row,'LEFT',47,-2)
-      row.find=CreateFrame('Button',nil,row,'UIPanelButtonTemplate'); row.find:SetSize(75,24); row.find:SetPoint('RIGHT',-6,0); row.find:SetText('Найти')
+      row.find=CreateFrame('Button',nil,row,'UIPanelButtonTemplate'); row.find:SetSize(75,24); row.find:SetPoint('RIGHT',-6,0); row.find:SetText(L('Найти'))
       row.find:SetScript('OnClick',function() putSearch(row.itemID,true) end)
       shoppingRows[i]=row
     end
@@ -612,9 +730,9 @@ showShoppingList=function(entry)
       local missing=math.max(0,item.count-bags-(bank or 0))
       local amount=missing>0 and missing or 1
       local price,approx=buyCost(WritHelperDB.snapshot,item.id,amount)
-      local priceText=price and (money(price)..(approx and ' (оценка)' or '')) or 'нет данных о цене'
-      local label=missing>0 and ('цена за '..amount..': ') or 'цена от: '
-      row.details:SetText('Сумки: '..bags..'  Банк: '..(bank==nil and '?' or tostring(bank))..'  '..label..priceText)
+      local priceText=price and money(price) or L('нет данных о цене')
+      local label=missing>0 and (L('цена за ')..amount..': ') or L('цена от: ')
+      row.details:SetText(L('Сумки: ')..bags..L('  Банк: ')..(bank==nil and '?' or tostring(bank))..'  '..label..priceText)
       offset=offset+65
     end
     row:Show()
@@ -633,14 +751,14 @@ local function relevantItems()
 end
 local function completeScan()
   local pending=state.pending
-  logEvent('Завершение: '..(pending.approximate and 'обычный поиск' or 'полный запрос')..', обработано='..state.total..', пропущено='..pending.unknown)
+  logEvent(L('Завершение: ')..(pending.approximate and L('обычный поиск') or L('полный запрос'))..L(', обработано=')..state.total..L(', пропущено=')..pending.unknown)
   WritHelperDB.snapshot={lots=pending.lots,quotes=pending.quotes,scanned=pending.scanned,count=state.total,unknown=pending.unknown,time=time(),updatedDuringRead=pending.updatedDuringRead,approximate=pending.approximate}
   state.phase='idle'; state.current=state.total
-  local note=pending.unknown>0 and ('; не распознано '..pending.unknown..' лотов') or ''
-  if pending.updatedDuringRead then note=note..'; повторное обновление при чтении' end
-  updateProgress('Готово: '..state.total..(pending.approximate and ' запросов' or ' лотов')..note, pending.unknown>0)
+  local note=pending.unknown>0 and (L('; не распознано ')..pending.unknown..L(' лотов')) or ''
+  if pending.updatedDuringRead then note=note..L('; повторное обновление при чтении') end
+  updateProgress(L('Готово: ')..state.total..(pending.approximate and L(' запросов') or L(' лотов'))..note, pending.unknown>0)
   state.pending=nil
-  msg('Сканирование завершено: '..state.total..(pending.approximate and ' запросов' or ' лотов')..note..'.')
+  msg(L('Сканирование завершено: ')..state.total..(pending.approximate and L(' запросов') or L(' лотов'))..note..'.')
   refresh()
 end
 local function processBatch(token)
@@ -674,14 +792,14 @@ local function processBatch(token)
   end
   state.current=last; state.index=last+1
   local percent=state.total>0 and math.floor(last*100/state.total) or 100
-  updateProgress(string.format('Обработка: %d%% (%d/%d лотов)',percent,last,state.total))
-  if state.index>state.total then completeScan() else C_Timer.After(0.01,function() local ok,err=pcall(processBatch,token); if not ok then fail('Ошибка обработки: '..tostring(err)) end end) end
+  updateProgress(string.format(L('Обработка: %d%% (%d/%d лотов)'),percent,last,state.total))
+  if state.index>state.total then completeScan() else C_Timer.After(0.01,function() local ok,err=pcall(processBatch,token); if not ok then fail(L('Ошибка обработки: ')..tostring(err)) end end) end
 end
 local function scanStandardNext(token, isPage)
   if state.token~=token or (state.phase~='standard' and state.phase~='standard_more') then return end
   local api=C_AuctionHouse
   if api.IsThrottledMessageSystemReady and not api.IsThrottledMessageSystemReady() then
-    updateProgress(string.format('Ожидание сервера: %d/%d запросов',state.current,state.total))
+    updateProgress(string.format(L('Ожидание сервера: %d/%d запросов'),state.current,state.total))
     C_Timer.After(0.5,function() scanStandardNext(token,isPage) end)
     return
   end
@@ -695,28 +813,28 @@ local function scanStandardNext(token, isPage)
     state.phase='standard_wait_first'
     ok,err=pcall(api.SendBrowseQuery,{searchString=request.name,sorts={},filters={},itemClassFilters={}})
   end
-  if not ok then fail('Ошибка обычного поиска: '..tostring(err)); return end
+  if not ok then fail(L('Ошибка обычного поиска: ')..tostring(err)); return end
   if not isPage and (state.current==0 or state.current%25==0) then
-    logEvent('Обычный поиск: обработано '..state.current..' из '..state.total)
+    logEvent(L('Обычный поиск: обработано ')..state.current..L(' из ')..state.total)
   end
   state.sequence=(state.sequence or 0)+1
   local seq=state.sequence
-  updateProgress(string.format('Обычный поиск: %d%% (%d/%d), %s',math.floor(state.current*100/state.total),state.current,state.total,request.name))
+  updateProgress(string.format(L('Обычный поиск: %d%% (%d/%d), %s'),math.floor(state.current*100/state.total),state.current,state.total,request.name))
   C_Timer.After(30,function()
     if state.token==token and state.sequence==seq and (state.phase=='standard_wait_first' or state.phase=='standard_wait_more') then
-      fail('Аукцион не ответил на обычный поиск. Результаты не сохранены; попробуйте снова.')
+      fail(L('Аукцион не ответил на обычный поиск. Результаты не сохранены; попробуйте снова.'))
     end
   end)
 end
 startStandard=function(reason)
   local api=C_AuctionHouse
   if not api or not api.SendBrowseQuery or not api.GetBrowseResults or not api.HasFullBrowseResults or not api.RequestMoreBrowseResults then
-    fail('Обычный поиск недоступен в этом клиенте.') return
+    fail(L('Обычный поиск недоступен в этом клиенте.')) return
   end
   state.token=(state.token or 0)+1
   local token=state.token
   state.phase='preparing'; state.current=0; state.total=0
-  logEvent('Запуск обычного поиска: '..tostring(reason))
+  logEvent(L('Запуск обычного поиска: ')..tostring(reason))
   local ids=relevantItems()
   local count=0
   for id in pairs(ids) do count=count+1; itemName(id) end
@@ -730,111 +848,139 @@ startStandard=function(reason)
       if name then requests[#requests+1]={id=id,name=name} else missing=missing+1 end
     end
     state.current=#requests
-    updateProgress(string.format('Загрузка названий: %d%% (%d/%d)',count>0 and math.floor(#requests*100/count) or 100,#requests,count))
+    updateProgress(string.format(L('Загрузка названий: %d%% (%d/%d)'),count>0 and math.floor(#requests*100/count) or 100,#requests,count))
     local now=GetTime and GetTime() or time()
     if missing>0 and now<deadline then C_Timer.After(1,waitForNames); return end
     table.sort(requests,function(a,b) return a.name<b.name end)
-    if #requests==0 then fail('Названия предметов не загрузились. Подождите и повторите.') return end
+    if #requests==0 then fail(L('Названия предметов не загрузились. Подождите и повторите.')) return end
     state.requests=requests
     state.pending={ids=ids,lots={},scanned={},unknown=missing,approximate=true}
     state.total=#requests; state.current=0; state.index=1; state.phase='standard'
-    logEvent('Подготовлено запросов: '..state.total..', не загрузились названия: '..missing)
-    if missing>0 then msg('Не удалось загрузить названия: '..missing..'. Список может быть неполным.') end
+    logEvent(L('Подготовлено запросов: ')..state.total..L(', не загрузились названия: ')..missing)
+    if missing>0 then msg(L('Не удалось загрузить названия: ')..missing..L('. Список может быть неполным.')) end
     scanStandardNext(token,false)
   end
-  updateProgress((reason or 'Обычный поиск')..': загрузка названий предметов...')
+  updateProgress((reason or L('Обычный поиск'))..L(': загрузка названий предметов...'))
   C_Timer.After(2,waitForNames)
 end
 local function startScan()
-  if state.phase~='idle' then msg('Сканирование уже идёт. Дождитесь завершения.') return end
-  if not ((AuctionFrame and AuctionFrame:IsShown()) or (AuctionHouseFrame and AuctionHouseFrame:IsShown())) then fail('Откройте аукцион.') return end
-  if not C_Timer or not C_Timer.After then fail('В клиенте недоступен таймер сканирования.') return end
-  if WritHelperDB.scanMode=='standard' then startStandard('Обычное сканирование'); return end
+  if state.phase~='idle' then msg(L('Сканирование уже идёт. Дождитесь завершения.')) return end
+  if not ((AuctionFrame and AuctionFrame:IsShown()) or (AuctionHouseFrame and AuctionHouseFrame:IsShown())) then fail(L('Откройте аукцион.')) return end
+  if not C_Timer or not C_Timer.After then fail(L('В клиенте недоступен таймер сканирования.')) return end
+  if WritHelperDB.scanMode=='standard' then startStandard(L('Обычное сканирование')); return end
   local modern=C_AuctionHouse and C_AuctionHouse.ReplicateItems and C_AuctionHouse.GetNumReplicateItems and C_AuctionHouse.GetReplicateItemInfo
   local legacy=CanSendAuctionQuery and QueryAuctionItems and GetNumAuctionItems and GetAuctionItemInfo
-  if not modern and not legacy then startStandard('Полный запрос недоступен; переход к обычному'); return end
+  if not modern and not legacy then startStandard(L('Полный запрос недоступен; переход к обычному')); return end
   if not modern then
     local ok,_,canAll=pcall(CanSendAuctionQuery)
-    if not ok or not canAll then startStandard('Полный запрос недоступен; переход к обычному'); return end
+    if not ok or not canAll then startStandard(L('Полный запрос недоступен; переход к обычному')); return end
   end
   state.backend=modern and 'replicate' or 'legacy'
   state.token=(state.token or 0)+1
   local token=state.token
   state.phase='waiting'; state.current=0; state.total=0; state.waitPercent=0
-  logEvent('Запуск полного запроса: '..state.backend)
+  logEvent(L('Запуск полного запроса: ')..state.backend)
   state.pending={ids=relevantItems(),lots={},quotes={},unknown=0}
-  updateProgress('Ожидание ответа: 0% времени до перехода на обычный поиск. Прогресс сервера неизвестен.')
+  updateProgress(L('Ожидание ответа: 0% времени до перехода на обычный поиск. Прогресс сервера неизвестен.'))
   local sent,err
   if state.backend=='replicate' then sent,err=pcall(C_AuctionHouse.ReplicateItems)
   else sent,err=pcall(QueryAuctionItems,'',nil,nil,0,nil,nil,true,false,nil) end
-  if not sent then startStandard('Ошибка полного запроса; переход к обычному'); return end
-  msg('Полное сканирование началось. Не запускайте другие поиски до завершения.')
+  if not sent then startStandard(L('Ошибка полного запроса; переход к обычному')); return end
+  msg(L('Полное сканирование началось. Не запускайте другие поиски до завершения.'))
   local started=GetTime and GetTime() or time()
   local function updateWait()
     if state.phase~='waiting' or state.token~=token then return end
     local now=GetTime and GetTime() or time()
     state.waitPercent=math.min(99,math.max(0,math.floor((now-started)*100/45)))
-    updateProgress('Ожидание ответа: '..state.waitPercent..'% времени до перехода на обычный поиск. Прогресс сервера неизвестен.')
+    updateProgress(L('Ожидание ответа: ')..state.waitPercent..L('% времени до перехода на обычный поиск. Прогресс сервера неизвестен.'))
     C_Timer.After(1,updateWait)
   end
   C_Timer.After(1,updateWait)
-  C_Timer.After(45,function() if state.phase=='waiting' and state.token==token then logEvent('Полный запрос: нет ответа за 45 секунд, переход к обычному'); msg('Полный запрос не ответил: переходим к обычному поиску.'); startStandard('Полный запрос не ответил; переход к обычному') end end)
+  C_Timer.After(45,function() if state.phase=='waiting' and state.token==token then logEvent(L('Полный запрос: нет ответа за 45 секунд, переход к обычному')); msg(L('Полный запрос не ответил: переходим к обычному поиску.')); startStandard(L('Полный запрос не ответил; переход к обычному')) end end)
 end
 local logWindow, logBox
 local function showLog()
   if not logWindow then
     logWindow=CreateFrame('Frame','WritHelperLogWindow',UIParent,'BasicFrameTemplateWithInset')
+    closeOnEscape('WritHelperLogWindow')
     logWindow:SetSize(690,470); logWindow:SetPoint('CENTER',50,20); logWindow:SetFrameStrata('DIALOG')
     logWindow:SetMovable(true); logWindow:EnableMouse(true); logWindow:RegisterForDrag('LeftButton')
     logWindow:SetScript('OnDragStart',logWindow.StartMoving); logWindow:SetScript('OnDragStop',logWindow.StopMovingOrSizing)
-    local title=logWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); title:SetPoint('TOP',0,-7); title:SetText('Журнал WritHelper')
+    local title=logWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); title:SetPoint('TOP',0,-7); title:SetText(L('Журнал WritHelper'))
     local hint=logWindow:CreateFontString(nil,'OVERLAY','GameFontNormalSmall'); hint:SetPoint('TOPLEFT',18,-38)
-    hint:SetText('Нажмите «Выделить для копирования», затем Ctrl+C.')
-    local copy=CreateFrame('Button',nil,logWindow,'UIPanelButtonTemplate'); copy:SetSize(205,25); copy:SetPoint('BOTTOMLEFT',18,16); copy:SetText('Выделить для копирования')
+    hint:SetText(L('Нажмите «Выделить для копирования», затем Ctrl+C.'))
+    local copy=CreateFrame('Button',nil,logWindow,'UIPanelButtonTemplate'); copy:SetSize(205,25); copy:SetPoint('BOTTOMLEFT',18,16); copy:SetText(L('Выделить для копирования'))
     copy:SetScript('OnClick',function() logBox:SetFocus(); logBox:HighlightText() end)
     local scroll=CreateFrame('ScrollFrame','WritHelperLogScroll',logWindow,'UIPanelScrollFrameTemplate')
     scroll:SetPoint('TOPLEFT',18,-65); scroll:SetPoint('BOTTOMRIGHT',-38,55)
     logBox=CreateFrame('EditBox',nil,scroll); logBox:SetMultiLine(true); logBox:SetAutoFocus(false); logBox:SetFontObject(ChatFontNormal); logBox:SetWidth(630); logBox:SetMaxLetters(0)
-    logBox:SetScript('OnEscapePressed',function(self) self:ClearFocus() end); scroll:SetScrollChild(logBox)
+    logBox:SetScript('OnEscapePressed',function(self) self:ClearFocus(); logWindow:Hide() end); scroll:SetScrollChild(logBox)
   end
-  local lines={'WritHelper '..VERSION..' — последние 1500 событий',''}
+  local lines={'WritHelper '..VERSION..L(' — последние 1500 событий'),''}
   for _,line in ipairs(WritHelperDB.log or {}) do lines[#lines+1]=line end
-  if #lines==2 then lines[#lines+1]='Событий пока нет.' end
+  if #lines==2 then lines[#lines+1]=L('Событий пока нет.') end
   logBox:SetText(table.concat(lines,'\n'))
   if frame then logWindow:SetFrameLevel(frame:GetFrameLevel()+50) end
   logWindow:Show()
 end
-local settingsWindow
+local settingsWindow, settingsDraft, resetSettings
 local function showSettings()
   if not settingsWindow then
     settingsWindow=CreateFrame('Frame','WritHelperSettingsWindow',UIParent,'BasicFrameTemplateWithInset')
-    settingsWindow:SetSize(500,350); settingsWindow:SetPoint('CENTER',80,0); settingsWindow:SetFrameStrata('DIALOG')
+    closeOnEscape('WritHelperSettingsWindow')
+    settingsWindow:SetSize(500,425); settingsWindow:SetPoint('CENTER',80,0); settingsWindow:SetFrameStrata('DIALOG')
     settingsWindow:SetMovable(true); settingsWindow:EnableMouse(true); settingsWindow:RegisterForDrag('LeftButton')
     settingsWindow:SetScript('OnDragStart',settingsWindow.StartMoving); settingsWindow:SetScript('OnDragStop',settingsWindow.StopMovingOrSizing)
-    local title=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); title:SetPoint('TOP',0,-7); title:SetText('Настройки WritHelper')
-    local header=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontNormal'); header:SetPoint('TOPLEFT',22,-42); header:SetText('Режим сканирования')
+    local title=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); title:SetPoint('TOP',0,-7); title:SetText(L('Настройки WritHelper'))
+    local header=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontNormal'); header:SetPoint('TOPLEFT',22,-42); header:SetText(L('Режим сканирования'))
     local full=CreateFrame('CheckButton',nil,settingsWindow,'UICheckButtonTemplate'); full:SetPoint('TOPLEFT',18,-65); full:SetSize(24,24)
-    local ft=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); ft:SetPoint('LEFT',full,'RIGHT',3,0); ft:SetText('Полный, с переходом на обычный')
+    local ft=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); ft:SetPoint('LEFT',full,'RIGHT',3,0); ft:SetText(L('Полный, с переходом на обычный'))
     local normal=CreateFrame('CheckButton',nil,settingsWindow,'UICheckButtonTemplate'); normal:SetPoint('TOPLEFT',18,-97); normal:SetSize(24,24)
-    local nt=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); nt:SetPoint('LEFT',normal,'RIGHT',3,0); nt:SetText('Обычный поиск')
+    local nt=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); nt:SetPoint('LEFT',normal,'RIGHT',3,0); nt:SetText(L('Обычный поиск'))
     local function setMode(mode)
-      WritHelperDB.scanMode=mode; full:SetChecked(mode~='standard'); normal:SetChecked(mode=='standard')
+      settingsDraft.scanMode=mode; full:SetChecked(mode~='standard'); normal:SetChecked(mode=='standard')
     end
     full:SetScript('OnClick',function() setMode('full') end); normal:SetScript('OnClick',function() setMode('standard') end)
-    setMode(WritHelperDB.scanMode or 'full')
     local only=CreateFrame('CheckButton',nil,settingsWindow,'UICheckButtonTemplate'); only:SetPoint('TOPLEFT',18,-145); only:SetSize(24,24)
-    local ot=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); ot:SetPoint('LEFT',only,'RIGHT',3,0); ot:SetText('Показывать только заказы с расчётом стоимости')
-    only:SetChecked(WritHelperDB.onlyCalculated and true or false)
-    only:SetScript('OnClick',function(self) WritHelperDB.onlyCalculated=self:GetChecked() and true or false; refresh() end)
+    local ot=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); ot:SetPoint('LEFT',only,'RIGHT',3,0); ot:SetText(L('Показывать только заказы с расчётом стоимости'))
+    only:SetScript('OnClick',function(self) settingsDraft.onlyCalculated=self:GetChecked() and true or false end)
     local materials=CreateFrame('CheckButton',nil,settingsWindow,'UICheckButtonTemplate'); materials:SetPoint('TOPLEFT',18,-178); materials:SetSize(24,24)
-    local mt=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); mt:SetPoint('LEFT',materials,'RIGHT',3,0); mt:SetText('Показывать список материалов в карточках')
-    materials:SetChecked(WritHelperDB.showMaterials~=false)
-    materials:SetScript('OnClick',function(self) WritHelperDB.showMaterials=self:GetChecked() and true or false; refresh() end)
-    local hint=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontNormalSmall'); hint:SetPoint('TOPLEFT',22,-215); hint:SetWidth(455); hint:SetJustifyH('LEFT'); hint:SetText('Полный запрос обычно доступен раз в 15 минут; ограничение задаёт игра. Режим действует со следующего сканирования.')
+    local mt=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlight'); mt:SetPoint('LEFT',materials,'RIGHT',3,0); mt:SetText(L('Показывать список материалов в карточках'))
+    materials:SetScript('OnClick',function(self) settingsDraft.showMaterials=self:GetChecked() and true or false end)
+    local hint=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontNormalSmall'); hint:SetPoint('TOPLEFT',22,-215); hint:SetWidth(455); hint:SetJustifyH('LEFT'); hint:SetText(L('Полный запрос обычно доступен раз в 15 минут; ограничение задаёт игра. Режим действует со следующего сканирования.'))
     sourceLabel=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontNormalSmall'); sourceLabel:SetPoint('TOPLEFT',22,-264); sourceLabel:SetWidth(455); sourceLabel:SetJustifyH('LEFT')
-    local journal=CreateFrame('Button',nil,settingsWindow,'UIPanelButtonTemplate'); journal:SetSize(105,23); journal:SetPoint('BOTTOMLEFT',22,15); journal:SetText('Журнал'); journal:SetScript('OnClick',showLog)
+    local languageHeader=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontNormal'); languageHeader:SetPoint('TOPLEFT',22,-300); languageHeader:SetText(L('Язык'))
+    local choices={{'auto',L('Как в игре')},{'ru','Русский'},{'en','English'},{'zh','中文'}}
+    local languageButtons={}
+    local function updateLanguageButtons()
+      for _,choice in ipairs(languageButtons) do choice.button:SetChecked(settingsDraft.language==choice.key) end
+    end
+    for i,choice in ipairs(choices) do
+      local button=CreateFrame('CheckButton',nil,settingsWindow,'UICheckButtonTemplate'); button:SetSize(21,21); button:SetPoint('TOPLEFT',18+(i-1)*117,-323)
+      local label=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlightSmall'); label:SetPoint('LEFT',button,'RIGHT',1,0); label:SetText(choice[2])
+      local key=choice[1]
+      languageButtons[#languageButtons+1]={button=button,key=key}
+      button:SetScript('OnClick',function()
+        settingsDraft.language=key; updateLanguageButtons()
+      end)
+    end
+    resetSettings=function()
+      settingsDraft={scanMode=WritHelperDB.scanMode or 'full',onlyCalculated=WritHelperDB.onlyCalculated and true or false,showMaterials=WritHelperDB.showMaterials~=false,language=WritHelperDB.language or 'auto'}
+      setMode(settingsDraft.scanMode); only:SetChecked(settingsDraft.onlyCalculated); materials:SetChecked(settingsDraft.showMaterials); updateLanguageButtons()
+    end
+    local languageHint=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontHighlightSmall'); languageHint:SetPoint('TOPLEFT',22,-352); languageHint:SetText(L('Смена языка после применения перезагрузит интерфейс.'))
+    local journal=CreateFrame('Button',nil,settingsWindow,'UIPanelButtonTemplate'); journal:SetSize(105,23); journal:SetPoint('BOTTOMLEFT',22,15); journal:SetText(L('Журнал')); journal:SetScript('OnClick',showLog)
+    local apply=CreateFrame('Button',nil,settingsWindow,'UIPanelButtonTemplate'); apply:SetSize(105,23); apply:SetPoint('BOTTOM',0,15); apply:SetText(L('Применить'))
+    apply:SetScript('OnClick',function()
+      local languageChanged=settingsDraft.language~=(WritHelperDB.language or 'auto')
+      if languageChanged and state.phase~='idle' then msg(L('Дождитесь завершения сканирования перед сменой языка.')); return end
+      WritHelperDB.scanMode=settingsDraft.scanMode; WritHelperDB.onlyCalculated=settingsDraft.onlyCalculated
+      WritHelperDB.showMaterials=settingsDraft.showMaterials; WritHelperDB.language=settingsDraft.language
+      if languageChanged and ReloadUI then ReloadUI() else refresh(); settingsWindow:Hide() end
+    end)
     local version=settingsWindow:CreateFontString(nil,'OVERLAY','GameFontNormalSmall'); version:SetPoint('BOTTOMRIGHT',-22,20); version:SetText('WritHelper v'..VERSION)
   end
+  resetSettings()
   if sourceLabel then sourceLabel:SetText(sourceText(state.usedSources)) end
   if frame then settingsWindow:SetFrameLevel(frame:GetFrameLevel()+30) end
   settingsWindow:Show()
@@ -842,81 +988,86 @@ end
 local function makeButton(parent,label,x,width,callback)
   local b=CreateFrame('Button',nil,parent,'UIPanelButtonTemplate')
   b:SetSize(width,25); b:SetPoint('TOPLEFT',x,-37); b:SetText(label)
-  b:SetScript('OnClick',function(...) local ok,err=pcall(callback,...); if not ok then fail('Ошибка: '..tostring(err)) end end)
+  b:SetScript('OnClick',function(...) local ok,err=pcall(callback,...); if not ok then fail(L('Ошибка: ')..tostring(err)) end end)
 end
 local function createUI()
   if frame then return end
   frame=CreateFrame('Frame','WritHelperFrame',UIParent,'BasicFrameTemplateWithInset')
+  closeOnEscape('WritHelperFrame')
   frame:SetFrameStrata('DIALOG'); frame:SetSize(780,600); frame:SetPoint('CENTER'); frame:SetMovable(true); frame:EnableMouse(true); frame:RegisterForDrag('LeftButton'); frame:SetScript('OnDragStart',frame.StartMoving); frame:SetScript('OnDragStop',frame.StopMovingOrSizing)
   frame.title=frame:CreateFontString(nil,'OVERLAY','GameFontHighlight'); frame.title:SetPoint('TOP',0,-7); frame.title:SetText('WritHelper Forever')
-  makeButton(frame,'Сканировать аукцион',15,200,startScan)
-  makeButton(frame,'Обновить результаты',220,175,refresh)
-  makeButton(frame,'Настройки',405,120,showSettings)
+  makeButton(frame,L('Сканировать аукцион'),15,200,startScan)
+  makeButton(frame,L('Настройки'),220,120,showSettings)
+  local hideCompleted=CreateFrame('CheckButton',nil,frame,'UICheckButtonTemplate')
+  hideCompleted:SetSize(22,22); hideCompleted:SetPoint('TOPLEFT',350,-38); hideCompleted:SetChecked(WritHelperDB.hideCompleted~=false)
+  local hideLabel=frame:CreateFontString(nil,'OVERLAY','GameFontHighlightSmall'); hideLabel:SetPoint('LEFT',hideCompleted,'RIGHT',2,0); hideLabel:SetText(L('Не показывать выполненные'))
+  hideCompleted:SetScript('OnClick',function(self)
+    WritHelperDB.hideCompleted=self:GetChecked() and true or false
+    refresh()
+    if resultsScroll then if resultsScroll.UpdateScrollChildRect then resultsScroll:UpdateScrollChildRect() end; resultsScroll:SetVerticalScroll(0) end
+  end)
   scanInfoButton=CreateFrame('Button',nil,frame)
-  scanInfoButton:SetSize(226,25); scanInfoButton:SetPoint('TOPRIGHT',-18,-73)
+  scanInfoButton:SetSize(190,25); scanInfoButton:SetPoint('TOPRIGHT',-76,-73)
   scanInfoButton.label=scanInfoButton:CreateFontString(nil,'OVERLAY','GameFontHighlightSmall')
   scanInfoButton.label:SetPoint('RIGHT',0,0)
   scanInfoButton:SetScript('OnEnter',function(self)
     local snapshot=WritHelperDB and WritHelperDB.snapshot
-    GameTooltip:SetOwner(self,'ANCHOR_LEFT'); GameTooltip:SetText('Сканирование WritHelper')
+    GameTooltip:SetOwner(self,'ANCHOR_LEFT'); GameTooltip:SetText(L('Сканирование WritHelper'))
     GameTooltip:AddLine(state.message or '',1,1,1,true)
     if snapshot then
-      GameTooltip:AddLine('Последнее: '..(snapshot.time and date and date('%d.%m.%Y %H:%M',snapshot.time) or '-'),0.8,0.8,0.8)
-      GameTooltip:AddLine('Обработано: '..tostring(snapshot.count or 0)..'; пропущено: '..tostring(snapshot.unknown or 0),0.8,0.8,0.8)
-      GameTooltip:AddLine('Заказов с учётом фильтров: '..tostring(state.foundCount or 0),0.8,0.8,0.8)
-      GameTooltip:AddLine('«Оценка» обозначает ориентировочную или сохранённую цену; наличие проверьте на аукционе.',1,0.82,0,true)
-      if (snapshot.unknown or 0)>0 then GameTooltip:AddLine('Часть данных не распознана; результаты могут быть неполными.',1,0.55,0,true) end
-      if snapshot.updatedDuringRead then GameTooltip:AddLine('При чтении пришло обновление; данные могли смешаться.',1,0.55,0,true) end
-      GameTooltip:AddLine('Количество в продаже показано на момент сканирования.',0.8,0.8,0.8,true)
-    else GameTooltip:AddLine('Сканирование ещё не завершено.',0.8,0.8,0.8) end
+      GameTooltip:AddLine(L('Последнее: ')..(snapshot.time and date and date('%d.%m.%Y %H:%M',snapshot.time) or '-'),0.8,0.8,0.8)
+      GameTooltip:AddLine(L('Обработано: ')..tostring(snapshot.count or 0)..L('; пропущено: ')..tostring(snapshot.unknown or 0),0.8,0.8,0.8)
+      GameTooltip:AddLine(L('Заказов с учётом фильтров: ')..tostring(state.foundCount or 0),0.8,0.8,0.8)
+      GameTooltip:AddLine(L('«Оценка» обозначает ориентировочную или сохранённую цену; наличие проверьте на аукционе.'),1,0.82,0,true)
+      if (snapshot.unknown or 0)>0 then GameTooltip:AddLine(L('Часть данных не распознана; результаты могут быть неполными.'),1,0.55,0,true) end
+      if snapshot.updatedDuringRead then GameTooltip:AddLine(L('При чтении пришло обновление; данные могли смешаться.'),1,0.55,0,true) end
+      GameTooltip:AddLine(L('Количество в продаже показано на момент сканирования.'),0.8,0.8,0.8,true)
+    else GameTooltip:AddLine(L('Сканирование ещё не завершено.'),0.8,0.8,0.8) end
     GameTooltip:Show()
   end)
   scanInfoButton:SetScript('OnLeave',function() GameTooltip:Hide() end)
-  local menus={}
-  local function dropdown(x,width,optionList,field,default,labelPrefix)
-    local button=CreateFrame('Button',nil,frame,'UIPanelButtonTemplate')
-    button:SetSize(width,23); button:SetPoint('TOPLEFT',x,-74)
-    local menu=CreateFrame('Frame',nil,frame)
-    menu:SetSize(width,#optionList*24+8); menu:SetPoint('TOPLEFT',button,'BOTTOMLEFT',0,-2)
-    menu:SetFrameStrata('DIALOG'); menu:SetFrameLevel(frame:GetFrameLevel()+45)
-    local bg=menu:CreateTexture(nil,'BACKGROUND'); bg:SetAllPoints(); bg:SetColorTexture(0.04,0.04,0.05,0.98)
+  stopButton=CreateFrame('Button',nil,frame,'UIPanelButtonTemplate')
+  stopButton:SetSize(53,22); stopButton:SetPoint('TOPRIGHT',-18,-75); stopButton:SetText(L('Стоп'))
+  stopButton:SetScript('OnClick',stopScan); stopButton:Hide()
+  local function dropdown(x,width,optionList,field,default,labelPrefix,y)
+    local button=CreateFrame('DropdownButton',nil,frame,'WowStyle1DropdownTemplate')
+    button:SetSize(width,23); button:SetPoint('TOPLEFT',x,y or -74)
+    local function options() return type(optionList)=='function' and optionList() or optionList end
     local function updateLabel()
       local selected=WritHelperDB[field]
       if selected==nil then selected=default end
-      local name=optionList[1].name
-      for _,option in ipairs(optionList) do if selected==option.key then name=option.name end end
-      button:SetText(labelPrefix..name..'  v')
+      local list=options()
+      local name=list[1].name
+      local found=false
+      for _,option in ipairs(list) do if selected==option.key then name=option.name; found=true end end
+      if not found then WritHelperDB[field]=default end
+      button:OverrideText(labelPrefix..name)
     end
-    for i,option in ipairs(optionList) do
-      local b=CreateFrame('Button',nil,menu,'UIPanelButtonTemplate')
-      b:SetSize(width-6,22); b:SetPoint('TOPLEFT',3,-3-(i-1)*24); b:SetText(option.name)
-      local selectedKey=option.key
-      b:SetScript('OnClick',function()
+    button:SetupMenu(function(_,root)
+      for _,option in ipairs(options()) do
+        local selectedKey=option.key
+        root:CreateRadio(option.name,function() return (WritHelperDB[field] or default)==selectedKey end,function()
         WritHelperDB[field]=selectedKey
-        menu:Hide(); updateLabel()
-        logEvent('Фильтр/сортировка: '..field..'='..tostring(selectedKey))
+        updateLabel()
+        logEvent(L('Фильтр/сортировка: ')..field..'='..tostring(selectedKey))
         local ok,err=pcall(refresh)
-        if not ok then fail('Не удалось обновить список: '..tostring(err)); return end
+        if not ok then fail(L('Не удалось обновить список: ')..tostring(err)); return end
         if resultsScroll then
           if resultsScroll.UpdateScrollChildRect then resultsScroll:UpdateScrollChildRect() end
           resultsScroll:SetVerticalScroll(0)
         end
-        logEvent('Список обновлён: заказов='..tostring(state.foundCount or 0))
-      end)
-    end
-    button:SetScript('OnClick',function()
-      local show=not menu:IsShown()
-      for _,other in ipairs(menus) do other:Hide() end
-      if show then menu:Show() end
+        logEvent(L('Список обновлён: заказов=')..tostring(state.foundCount or 0))
+        end)
+      end
     end)
-    menus[#menus+1]=menu
-    menu:Hide(); updateLabel()
+    updateLabel()
   end
-  dropdown(15,145,{{key=0,name='Все'},{key=75,name='75'},{key=125,name='125'},{key=200,name='200'}},'repFilter',0,'Реп.: ')
-  dropdown(165,160,{{key='price',name='Общая цена'},{key='efficiency',name='Цена / репутация'}},'sortBy','price','')
-  dropdown(330,185,{{key='all',name='Все профессии'},{key='alchemy',name='Алхимия'},{key='blacksmith',name='Кузнечное дело'},{key='engineering',name='Инженерное дело'},{key='leatherworking',name='Кожевничество'},{key='tailoring',name='Портняжное дело'}},'profFilter','all','')
+  dropdown(15,145,{{key=0,name=L('Все')},{key=75,name='75'},{key=125,name='125'},{key=200,name='200'}},'repFilter',0,L('Реп.: '))
+  dropdown(165,160,{{key='price',name=L('Общая цена')},{key='efficiency',name=L('Цена / репутация')}},'sortBy','price','')
+  dropdown(330,185,{{key='all',name=L('Все профессии')},{key='alchemy',name=L('Алхимия')},{key='blacksmith',name=L('Кузнечное дело')},{key='engineering',name=L('Инженерное дело')},{key='leatherworking',name=L('Кожевничество')},{key='tailoring',name=L('Портняжное дело')}},'profFilter','all','')
+  dropdown(15,360,locationOptions,'locationFilter','all','',-103)
   updateProgress(state.message,state.error)
-  local scroll=CreateFrame('ScrollFrame','WritHelperScroll',frame,'UIPanelScrollFrameTemplate'); resultsScroll=scroll; scroll:SetPoint('TOPLEFT',18,-107); scroll:SetPoint('BOTTOMRIGHT',-35,29)
+  local scroll=CreateFrame('ScrollFrame','WritHelperScroll',frame,'UIPanelScrollFrameTemplate'); resultsScroll=scroll; scroll:SetPoint('TOPLEFT',18,-137); scroll:SetPoint('BOTTOMRIGHT',-35,29)
   output=CreateFrame('Frame',nil,scroll); output:SetSize(720,430); scroll:SetScrollChild(output)
   resultHeader=textAt(output,'GameFontHighlightSmall',0,0,710)
   frame:Hide()
@@ -953,8 +1104,8 @@ local function createMinimapButton()
   button:SetScript('OnEnter', function(self)
     GameTooltip:SetOwner(self, 'ANCHOR_LEFT')
     GameTooltip:SetText('WritHelper Forever')
-    GameTooltip:AddLine('Нажмите, чтобы открыть заказы.', 1, 1, 1)
-    GameTooltip:AddLine('Перетащите, чтобы переместить кнопку.', 0.8, 0.8, 0.8)
+    GameTooltip:AddLine(L('Нажмите, чтобы открыть заказы.'), 1, 1, 1)
+    GameTooltip:AddLine(L('Перетащите, чтобы переместить кнопку.'), 0.8, 0.8, 0.8)
     GameTooltip:Show()
   end)
   button:SetScript('OnLeave', function() GameTooltip:Hide() end)
@@ -986,7 +1137,7 @@ local function setupAuctionButton()
     auctionButton:SetScript('OnEnter', function(self)
       GameTooltip:SetOwner(self, 'ANCHOR_RIGHT')
       GameTooltip:SetText('WritHelper Forever')
-      GameTooltip:AddLine('Открыть WritHelper', 1, 1, 1)
+      GameTooltip:AddLine(L('Открыть WritHelper'), 1, 1, 1)
       GameTooltip:AddLine(state.message or '', 0.8, 0.8, 0.8)
       GameTooltip:Show()
     end)
@@ -1007,11 +1158,11 @@ local function initialize()
   if initialized then return end
   initialized=true
   WritHelperDB=WritHelperDB or {}; WritHelperDB.recipes=WritHelperDB.recipes or {}; WritHelperDB.log=WritHelperDB.log or {}
-  logEvent('Загружена версия '..VERSION)
+  logEvent(L('Загружена версия ')..VERSION)
   SLASH_WRITHELPER1='/writ'; SlashCmdList.WRITHELPER=toggleUI
   local ok,err=pcall(createMinimapButton)
-  if not ok then msg('Кнопка миникарты недоступна: '..tostring(err)) end
-  msg('Загружен. Команда: /writ')
+  if not ok then msg(L('Кнопка миникарты недоступна: ')..tostring(err)) end
+  msg(L('Загружен. Команда: /writ'))
 end
 events:SetScript('OnEvent',function(_,event,arg)
   if event=='ADDON_LOADED' and arg==ADDON then initialize()
@@ -1023,25 +1174,27 @@ events:SetScript('OnEvent',function(_,event,arg)
     if C_Timer and C_Timer.After then C_Timer.After(0.5,function() if bankOpen then captureBank(); if frame and frame:IsShown() then refresh() end end end) else captureBank() end
   elseif event=='BANKFRAME_CLOSED' then
     bankOpen=false
-  elseif (event=='BAG_UPDATE_DELAYED' or event=='PLAYERBANKSLOTS_CHANGED') and bankOpen then
-    if C_Timer and C_Timer.After then C_Timer.After(0.2,function() if bankOpen then captureBank(); if frame and frame:IsShown() then refresh() end end end) else captureBank() end
+  elseif event=='BAG_UPDATE_DELAYED' or event=='PLAYERBANKSLOTS_CHANGED' then
+    if bankOpen then
+      if C_Timer and C_Timer.After then C_Timer.After(0.2,function() if bankOpen then captureBank(); if frame and frame:IsShown() then refresh() end end end) else captureBank(); if frame and frame:IsShown() then refresh() end end
+    elseif event=='BAG_UPDATE_DELAYED' and frame and frame:IsShown() then refresh() end
   elseif event=='AUCTION_HOUSE_SHOW' then
     if C_Timer and C_Timer.After then C_Timer.After(0.2,setupAuctionButton) else setupAuctionButton() end
   elseif event=='AUCTION_HOUSE_CLOSED' then
-    if state.phase~='idle' then fail('Сканирование прервано: аукцион закрыт.') end
+    if state.phase~='idle' then fail(L('Сканирование прервано: аукцион закрыт.')) end
     if frame then frame:Hide() end
   elseif event=='AUCTION_HOUSE_BROWSE_FAILURE' and (state.phase=='standard_wait_first' or state.phase=='standard_wait_more') then
-    fail('Обычный поиск отклонён аукционом. Попробуйте снова.')
+    fail(L('Обычный поиск отклонён аукционом. Попробуйте снова.'))
   elseif (event=='AUCTION_HOUSE_BROWSE_RESULTS_UPDATED' and state.phase=='standard_wait_first') or (event=='AUCTION_HOUSE_BROWSE_RESULTS_ADDED' and state.phase=='standard_wait_more') then
     local token=state.token
     local ok,full=pcall(C_AuctionHouse.HasFullBrowseResults)
-    if not ok then fail('Не удалось проверить результаты поиска: '..tostring(full)); return end
+    if not ok then fail(L('Не удалось проверить результаты поиска: ')..tostring(full)); return end
     if not full then
       state.phase='standard_more'
       C_Timer.After(0,function() scanStandardNext(token,true) end)
     else
       local got,results=pcall(C_AuctionHouse.GetBrowseResults)
-      if not got or type(results)~='table' then fail('Не удалось прочитать результаты обычного поиска.'); return end
+      if not got or type(results)~='table' then fail(L('Не удалось прочитать результаты обычного поиска.')); return end
       local request=state.requests[state.index]
       local best,quantity=nil,0
       for _,row in ipairs(results) do
@@ -1056,31 +1209,31 @@ events:SetScript('OnEvent',function(_,event,arg)
       state.pending.scanned[request.id]=true
       state.current=state.current+1; state.index=state.index+1
       state.phase='standard'
-      updateProgress(string.format('Обычный поиск: %d%% (%d/%d)',math.floor(state.current*100/state.total),state.current,state.total))
+      updateProgress(string.format(L('Обычный поиск: %d%% (%d/%d)'),math.floor(state.current*100/state.total),state.current,state.total))
       if state.index>state.total then completeScan()
       else C_Timer.After(0,function() scanStandardNext(token,false) end) end
     end
   elseif ((event=='AUCTION_ITEM_LIST_UPDATE' and state.backend=='legacy') or (event=='REPLICATE_ITEM_LIST_UPDATE' and state.backend=='replicate')) and state.phase=='processing' then
     if state.pending then state.pending.updatedDuringRead=true end
   elseif ((event=='AUCTION_ITEM_LIST_UPDATE' and state.backend=='legacy') or (event=='REPLICATE_ITEM_LIST_UPDATE' and state.backend=='replicate')) and state.phase=='waiting' then
-    logEvent('Получено событие полного списка: '..event)
+    logEvent(L('Получено событие полного списка: ')..event)
     local ok,num
     if state.backend=='replicate' then ok,num=pcall(C_AuctionHouse.GetNumReplicateItems) else ok,num=pcall(GetNumAuctionItems,'list') end
-    if not ok or type(num)~='number' then fail('Не удалось получить список лотов.') return end
-    logEvent('Полный список: '..num..' лотов')
+    if not ok or type(num)~='number' then fail(L('Не удалось получить список лотов.')) return end
+    logEvent(L('Полный список: ')..num..L(' лотов'))
     state.phase='processing'; state.total=num; state.current=0; state.index=1
-    updateProgress('Получено лотов: '..num..'. Обработка…')
+    updateProgress(L('Получено лотов: ')..num..L('. Обработка…'))
     if num==0 then completeScan() else
       local token=state.token
-      C_Timer.After(0,function() local success,err=pcall(processBatch,token); if not success then fail('Ошибка обработки: '..tostring(err)) end end)
+      C_Timer.After(0,function() local success,err=pcall(processBatch,token); if not success then fail(L('Ошибка обработки: ')..tostring(err)) end end)
     end
   elseif (event=='TRADE_SKILL_SHOW' or event=='TRADE_SKILL_LIST_UPDATE' or event=='TRADE_SKILL_UPDATE') and WritHelperDB then
-    local ok,err=pcall(captureTradeskill); if ok and bankOpen then captureBank() end; if not ok then logEvent('Ошибка профессии: '..tostring(err)); msg('Не удалось прочитать профессию: '..tostring(err)) elseif frame and frame:IsShown() then refresh() end
+    local ok,err=pcall(captureTradeskill); if ok and bankOpen then captureBank() end; if not ok then logEvent(L('Ошибка профессии: ')..tostring(err)); msg(L('Не удалось прочитать профессию: ')..tostring(err)) elseif frame and frame:IsShown() then refresh() end
     if event=='TRADE_SKILL_SHOW' and C_Timer and C_Timer.After then
       C_Timer.After(1,function()
         local success,problem=pcall(captureTradeskill)
         if success and bankOpen then captureBank() end
-        if not success then logEvent('Ошибка профессии: '..tostring(problem)); msg('Не удалось прочитать профессию: '..tostring(problem)) elseif frame and frame:IsShown() then refresh() end
+        if not success then logEvent(L('Ошибка профессии: ')..tostring(problem)); msg(L('Не удалось прочитать профессию: ')..tostring(problem)) elseif frame and frame:IsShown() then refresh() end
       end)
     end
   end
