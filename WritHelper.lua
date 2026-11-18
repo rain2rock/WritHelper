@@ -998,14 +998,6 @@ local function createUI()
   frame.title=frame:CreateFontString(nil,'OVERLAY','GameFontHighlight'); frame.title:SetPoint('TOP',0,-7); frame.title:SetText('WritHelper Forever')
   makeButton(frame,L('Сканировать аукцион'),15,200,startScan)
   makeButton(frame,L('Настройки'),220,120,showSettings)
-  local hideCompleted=CreateFrame('CheckButton',nil,frame,'UICheckButtonTemplate')
-  hideCompleted:SetSize(22,22); hideCompleted:SetPoint('TOPLEFT',350,-38); hideCompleted:SetChecked(WritHelperDB.hideCompleted~=false)
-  local hideLabel=frame:CreateFontString(nil,'OVERLAY','GameFontHighlightSmall'); hideLabel:SetPoint('LEFT',hideCompleted,'RIGHT',2,0); hideLabel:SetText(L('Не показывать выполненные'))
-  hideCompleted:SetScript('OnClick',function(self)
-    WritHelperDB.hideCompleted=self:GetChecked() and true or false
-    refresh()
-    if resultsScroll then if resultsScroll.UpdateScrollChildRect then resultsScroll:UpdateScrollChildRect() end; resultsScroll:SetVerticalScroll(0) end
-  end)
   scanInfoButton=CreateFrame('Button',nil,frame)
   scanInfoButton:SetSize(190,25); scanInfoButton:SetPoint('TOPRIGHT',-76,-73)
   scanInfoButton.label=scanInfoButton:CreateFontString(nil,'OVERLAY','GameFontHighlightSmall')
@@ -1061,11 +1053,20 @@ local function createUI()
       end
     end)
     updateLabel()
+    return button
   end
   dropdown(15,145,{{key=0,name=L('Все')},{key=75,name='75'},{key=125,name='125'},{key=200,name='200'}},'repFilter',0,L('Реп.: '))
   dropdown(165,160,{{key='price',name=L('Общая цена')},{key='efficiency',name=L('Цена / репутация')}},'sortBy','price','')
   dropdown(330,185,{{key='all',name=L('Все профессии')},{key='alchemy',name=L('Алхимия')},{key='blacksmith',name=L('Кузнечное дело')},{key='engineering',name=L('Инженерное дело')},{key='leatherworking',name=L('Кожевничество')},{key='tailoring',name=L('Портняжное дело')}},'profFilter','all','')
-  dropdown(15,360,locationOptions,'locationFilter','all','',-103)
+  local locationFilter=dropdown(15,360,locationOptions,'locationFilter','all','',-103)
+  local hideCompleted=CreateFrame('CheckButton',nil,frame,'UICheckButtonTemplate')
+  hideCompleted:SetSize(22,22); hideCompleted:SetPoint('LEFT',locationFilter,'RIGHT',10,0); hideCompleted:SetChecked(WritHelperDB.hideCompleted~=false)
+  local hideLabel=frame:CreateFontString(nil,'OVERLAY','GameFontHighlightSmall'); hideLabel:SetPoint('LEFT',hideCompleted,'RIGHT',2,0); hideLabel:SetText(L('Не показывать выполненные'))
+  hideCompleted:SetScript('OnClick',function(self)
+    WritHelperDB.hideCompleted=self:GetChecked() and true or false
+    refresh()
+    if resultsScroll then if resultsScroll.UpdateScrollChildRect then resultsScroll:UpdateScrollChildRect() end; resultsScroll:SetVerticalScroll(0) end
+  end)
   updateProgress(state.message,state.error)
   local scroll=CreateFrame('ScrollFrame','WritHelperScroll',frame,'UIPanelScrollFrameTemplate'); resultsScroll=scroll; scroll:SetPoint('TOPLEFT',18,-137); scroll:SetPoint('BOTTOMRIGHT',-35,29)
   output=CreateFrame('Frame',nil,scroll); output:SetSize(720,430); scroll:SetScrollChild(output)
