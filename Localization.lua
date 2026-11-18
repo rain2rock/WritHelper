@@ -16,6 +16,7 @@ local translations = {
   ['Открыта следующая точка маршрута из игры; она может быть переходом, а не местом сдачи.'] = {en='Showing the game’s next route point; it may be a transition rather than the turn-in.', zh='显示游戏的下一路线点；它可能是中转点，而非交付地点。'},
   ['Карта недоступна во время боя.'] = {en='The map is unavailable during combat.', zh='战斗中无法打开地图。'},
   ['Метка приблизительная: координаты сообщены игроками Wowhead.'] = {en='The waypoint is approximate, based on Wowhead player reports.', zh='路径点为大致位置，来自 Wowhead 玩家报告。'},
+  ['Поблагодарить автора'] = {en='Thank the author', zh='感谢作者'},
   ['Применить'] = {en='Apply', zh='应用'},
   ['Смена языка после применения перезагрузит интерфейс.'] = {en='Applying a language change reloads the interface.', zh='应用语言更改将重新加载界面。'},
   ['Язык'] = {en='Language', zh='语言'},
